@@ -1103,6 +1103,18 @@ public class SMCHelper {
         guard let helper = self.helper(nil) else { return }
         helper.resetFanControl { _ in }
     }
+
+    public func setLowPowerMode(_ enabled: Bool, powerSource: String, completion: ((String?) -> Void)? = nil) {
+        guard let helper = self.helper(nil) else {
+            completion?("Fan helper is unavailable")
+            return
+        }
+        helper.setLowPowerMode(enabled: enabled, powerSource: powerSource) { error in
+            DispatchQueue.main.async {
+                completion?(error)
+            }
+        }
+    }
     
     public func isActive() -> Bool {
         return self.connection != nil

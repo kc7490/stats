@@ -21,6 +21,7 @@ internal class Popup: PopupWrapper {
     private var sensors: [Sensor_p] = []
     private let settingsView: NSStackView = NSStackView()
     private let sensorsCache = PopupCache<[Sensor_p]>()
+    private var coolingView: CoolingView? = nil
     
     private var fanControlState: Bool {
         get { Store.shared.bool(key: "Sensors_fanControl", defaultValue: true) }
@@ -91,6 +92,15 @@ internal class Popup: PopupWrapper {
         }
         
         if !fans.isEmpty {
+            if self.coolingView == nil {
+                self.coolingView = CoolingView(width: self.frame.width)
+            }
+            self.coolingView?.update(values)
+            self.addArrangedSubview(separatorView(localizedString("Cooling"), width: self.frame.width))
+            if let coolingView = self.coolingView {
+                self.addArrangedSubview(coolingView)
+            }
+
             let separator = SeparatorView(
                 label: localizedString("Fans"),
                 button: PopupButton(toolTip: localizedString("Control"), state: self.fanControlState) { [weak self] in
@@ -187,6 +197,7 @@ internal class Popup: PopupWrapper {
     
     internal func usageCallback(_ values: [Sensor_p]) {
         DispatchQueue.main.async(execute: {
+            self.coolingView?.update(values)
             values.filter({ $0 is Sensor }).forEach { (s: Sensor_p) in
                 if let sensor = self.list[s.key] as? SensorView {
                     sensor.addHistoryPoint(s)
@@ -248,6 +259,358 @@ internal class Popup: PopupWrapper {
     @objc private func toggleFanControl() {
         self.fanControlState = !self.fanControlState
         NotificationCenter.default.post(name: .toggleFanControl, object: nil, userInfo: ["state": self.fanControlState])
+    }
+}
+
+// MARK: - One-click cooling
+
+private enum CoolingProfile: String, CaseIterable {
+    case quiet = "Quiet Cool"
+    case fast = "Fast Cool"
+    case gaming = "Gaming"
+
+    var fanRatio: Double {
+        switch self {
+        case .quiet: return 0.60
+        case .fast: return 0.85
+        case .gaming: return 0.75
+        }
+    }
+
+    var duration: TimeInterval {
+        switch self {
+        case .quiet: return 10 * 60
+        case .fast: return 10 * 60
+        case .gaming: return 20 * 60
+        }
+    }
+
+    var targetTemperature: Double {
+        switch self {
+        case .quiet: return 55
+        case .fast: return 55
+        case .gaming: return 65
+        }
+    }
+
+    var enablesLowPowerMode: Bool {
+        self != .gaming
+    }
+}
+
+private final class CoolingView: NSStackView {
+    private let profileButton = NSPopUpButton()
+    private let actionButton = NSButton(title: localizedString("Cool Now"), target: nil, action: nil)
+    private let statusField = NSTextField(labelWithString: "")
+    private let processField = NSTextField(labelWithString: "")
+    private let reviewButton = NSButton(title: localizedString("Review"), target: nil, action: nil)
+
+    private var fans: [Fan] = []
+    private var currentTemperature: Double? = nil
+    private var activeProfile: CoolingProfile? = nil
+    private var endsAt: Date? = nil
+    private var timer: Timer? = nil
+    private var coolSamples = 0
+    private var lowPowerWasEnabled = false
+    private var lowPowerSource = "battery"
+    private var fanStates: [Int: (mode: FanMode, speed: Int?)] = [:]
+
+    init(width: CGFloat) {
+        super.init(frame: NSRect(x: 0, y: 0, width: width, height: 94))
+
+        self.orientation = .vertical
+        self.spacing = 5
+        self.edgeInsets = NSEdgeInsets(top: 6, left: Constants.Popup.margins/2, bottom: 7, right: Constants.Popup.margins/2)
+        self.wantsLayer = true
+        self.layer?.cornerRadius = Constants.Popup.radius
+
+        let controls = NSStackView()
+        controls.orientation = .horizontal
+        controls.spacing = 6
+        controls.distribution = .fill
+
+        self.profileButton.addItems(withTitles: CoolingProfile.allCases.map(\.rawValue))
+        self.profileButton.selectItem(withTitle: CoolingProfile.fast.rawValue)
+        self.profileButton.target = self
+        self.profileButton.action = #selector(self.profileChanged)
+
+        self.actionButton.target = self
+        self.actionButton.action = #selector(self.toggleCooling)
+        self.actionButton.bezelStyle = .rounded
+        self.actionButton.keyEquivalent = "\r"
+
+        controls.addArrangedSubview(self.profileButton)
+        controls.addArrangedSubview(self.actionButton)
+        self.actionButton.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        self.statusField.font = NSFont.systemFont(ofSize: 11)
+        self.statusField.textColor = .secondaryLabelColor
+        self.statusField.lineBreakMode = .byTruncatingTail
+        self.statusField.stringValue = self.profileSummary(.fast)
+
+        let processRow = NSStackView()
+        processRow.orientation = .horizontal
+        processRow.spacing = 4
+        processRow.distribution = .fill
+
+        self.processField.font = NSFont.systemFont(ofSize: 10)
+        self.processField.textColor = .tertiaryLabelColor
+        self.processField.lineBreakMode = .byTruncatingTail
+        self.processField.stringValue = localizedString("Top heat sources appear here")
+
+        self.reviewButton.target = self
+        self.reviewButton.action = #selector(self.openActivityMonitor)
+        self.reviewButton.bezelStyle = .inline
+        self.reviewButton.font = NSFont.systemFont(ofSize: 10)
+
+        processRow.addArrangedSubview(self.processField)
+        processRow.addArrangedSubview(self.reviewButton)
+        self.reviewButton.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+
+        self.addArrangedSubview(controls)
+        self.addArrangedSubview(self.statusField)
+        self.addArrangedSubview(processRow)
+
+        NSLayoutConstraint.activate([
+            self.widthAnchor.constraint(equalToConstant: width),
+            self.heightAnchor.constraint(equalToConstant: 94)
+        ])
+        self.refreshTopProcesses()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        self.timer?.invalidate()
+        if self.activeProfile != nil {
+            self.restoreSystemState()
+        }
+    }
+
+    func update(_ sensors: [Sensor_p]) {
+        self.fans = sensors.compactMap { $0 as? Fan }.filter { !$0.isComputed }
+        let temperatures = sensors.filter { $0.type == .temperature && $0.value.isFinite }.map(\.value)
+        self.currentTemperature = temperatures.max()
+
+        guard let profile = self.activeProfile, let temperature = self.currentTemperature else { return }
+        if temperature <= profile.targetTemperature {
+            self.coolSamples += 1
+        } else {
+            self.coolSamples = 0
+        }
+        if self.coolSamples >= 3 {
+            self.stopCooling(message: localizedString("Target temperature reached"))
+        }
+    }
+
+    @objc private func profileChanged() {
+        guard self.activeProfile == nil else { return }
+        self.statusField.stringValue = self.profileSummary(self.selectedProfile)
+    }
+
+    @objc private func toggleCooling() {
+        if self.activeProfile == nil {
+            self.startCooling()
+        } else {
+            self.stopCooling(message: localizedString("Cooling stopped"))
+        }
+    }
+
+    private func startCooling() {
+        guard !self.fans.isEmpty else {
+            self.statusField.stringValue = localizedString("No controllable fans were detected")
+            return
+        }
+        guard SMCHelper.shared.isInstalled else {
+            self.installFanHelper()
+            return
+        }
+
+        let profile = self.selectedProfile
+        self.activeProfile = profile
+        self.endsAt = Date().addingTimeInterval(profile.duration)
+        self.coolSamples = 0
+        self.lowPowerSource = Self.activePowerSource()
+        self.lowPowerWasEnabled = Self.lowPowerModeEnabled()
+        self.fanStates = Dictionary(uniqueKeysWithValues: self.fans.map { fan in
+            (fan.id, (fan.mode, fan.customSpeed ?? Int(fan.value)))
+        })
+
+        self.fans.forEach { fan in
+            let range = max(0, fan.maxSpeed - fan.minSpeed)
+            let speed = Int(fan.minSpeed + (range * profile.fanRatio))
+            SMCHelper.shared.setFanMode(fan.id, mode: FanMode.forced.rawValue)
+            SMCHelper.shared.setFanSpeed(fan.id, speed: speed)
+        }
+        if profile.enablesLowPowerMode && !self.lowPowerWasEnabled {
+            SMCHelper.shared.setLowPowerMode(true, powerSource: self.lowPowerSource) { [weak self] error in
+                if let error {
+                    self?.statusField.stringValue = localizedString("Fans boosted; Low Power Mode failed") + ": \(error)"
+                }
+            }
+        }
+
+        self.profileButton.isEnabled = false
+        self.actionButton.title = localizedString("Stop Cooling")
+        self.timer?.invalidate()
+        self.timer = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(self.tick), userInfo: nil, repeats: true)
+        self.tick()
+        self.refreshTopProcesses()
+    }
+
+    private func stopCooling(message: String) {
+        guard self.activeProfile != nil else { return }
+        self.timer?.invalidate()
+        self.timer = nil
+        self.restoreSystemState()
+        self.activeProfile = nil
+        self.endsAt = nil
+        self.profileButton.isEnabled = true
+        self.actionButton.title = localizedString("Cool Now")
+        let temperature = self.currentTemperature.map { String(format: "%.1f°C", $0) } ?? "—"
+        self.statusField.stringValue = "\(message) • \(temperature)"
+    }
+
+    private func restoreSystemState() {
+        self.fanStates.forEach { id, state in
+            if state.mode.isAutomatic {
+                SMCHelper.shared.setFanMode(id, mode: FanMode.automatic.rawValue)
+            } else {
+                SMCHelper.shared.setFanMode(id, mode: state.mode.rawValue)
+                if let speed = state.speed {
+                    SMCHelper.shared.setFanSpeed(id, speed: speed)
+                }
+            }
+        }
+        self.fanStates.removeAll()
+        if !self.lowPowerWasEnabled {
+            SMCHelper.shared.setLowPowerMode(false, powerSource: self.lowPowerSource)
+        }
+    }
+
+    @objc private func tick() {
+        guard let endsAt = self.endsAt else { return }
+        let remaining = max(0, Int(endsAt.timeIntervalSinceNow.rounded(.up)))
+        if remaining == 0 {
+            self.stopCooling(message: localizedString("Cooling timer complete"))
+            return
+        }
+        let minutes = remaining / 60
+        let seconds = remaining % 60
+        let temperature = self.currentTemperature.map { String(format: "%.1f°C", $0) } ?? "—"
+        self.statusField.stringValue = String(format: localizedString("Cooling • %@ • %02d:%02d remaining"), temperature, minutes, seconds)
+    }
+
+    private var selectedProfile: CoolingProfile {
+        CoolingProfile(rawValue: self.profileButton.titleOfSelectedItem ?? "") ?? .fast
+    }
+
+    private func profileSummary(_ profile: CoolingProfile) -> String {
+        let fanPercent = Int(profile.fanRatio * 100)
+        let power = profile.enablesLowPowerMode ? localizedString("Low Power Mode on") : localizedString("full performance")
+        return "\(fanPercent)% fans • \(power) • \(Int(profile.duration/60)) min"
+    }
+
+    private func installFanHelper() {
+        self.actionButton.isEnabled = false
+        self.statusField.stringValue = localizedString("Enabling fan control…")
+        SMCHelper.shared.install { [weak self] state in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.actionButton.isEnabled = true
+                switch state {
+                case .enabled:
+                    self.statusField.stringValue = localizedString("Fan control enabled—click Cool Now again")
+                case .requiresApproval:
+                    self.statusField.stringValue = localizedString("Approve Stats in System Settings ▸ Login Items")
+                    SMCHelper.shared.openLoginItems()
+                case .failed:
+                    self.statusField.stringValue = localizedString("Could not enable the fan helper")
+                }
+            }
+        }
+    }
+
+    private func refreshTopProcesses() {
+        DispatchQueue.global(qos: .utility).async {
+            let value = Self.topProcesses()
+            DispatchQueue.main.async { [weak self] in
+                self?.processField.stringValue = value.isEmpty ? localizedString("No heavy processes detected") : localizedString("Top heat") + ": " + value
+            }
+        }
+    }
+
+    private static func topProcesses() -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-Ao", "pid=,%cpu=,comm="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return ""
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return "" }
+
+        return output.split(separator: "\n").compactMap { line -> (Double, String)? in
+            let fields = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
+            guard fields.count == 3,
+                  Int(fields[0]) != ProcessInfo.processInfo.processIdentifier,
+                  let cpu = Double(fields[1]), cpu >= 5 else { return nil }
+            let name = URL(fileURLWithPath: String(fields[2])).lastPathComponent
+            return (cpu, name)
+        }.sorted { $0.0 > $1.0 }.prefix(3).map {
+            "\($0.1) \(Int($0.0))%"
+        }.joined(separator: ", ")
+    }
+
+    private static func lowPowerModeEnabled() -> Bool {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        task.arguments = ["-g"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return false
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8) else { return false }
+        return output.split(separator: "\n").contains { line in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            return fields.count >= 2 && fields[0] == "lowpowermode" && fields[1] == "1"
+        }
+    }
+
+    private static func activePowerSource() -> String {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        task.arguments = ["-g", "batt"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return "battery"
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.contains("AC Power") ? "charger" : "battery"
+    }
+
+    @objc private func openActivityMonitor() {
+        NSWorkspace.shared.openApplication(
+            at: URL(fileURLWithPath: "/System/Applications/Utilities/Activity Monitor.app"),
+            configuration: NSWorkspace.OpenConfiguration()
+        )
     }
 }
 

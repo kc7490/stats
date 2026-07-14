@@ -18,6 +18,7 @@ import Foundation
     func setFanMode(id: Int, mode: Int, completion: @escaping (String?) -> Void)
     func setFanSpeed(id: Int, value: Int, completion: @escaping (String?) -> Void)
     func resetFanControl(completion: @escaping (String?) -> Void)
+    func setLowPowerMode(enabled: Bool, powerSource: String, completion: @escaping (String?) -> Void)
     
     func uninstall()
 }

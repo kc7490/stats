@@ -178,6 +178,39 @@ extension Helper {
             completion(result.output)
         }
     }
+
+    func setLowPowerMode(enabled: Bool, powerSource: String, completion: (String?) -> Void) {
+        let scope: String
+        switch powerSource {
+        case "battery": scope = "-b"
+        case "charger": scope = "-c"
+        default:
+            completion("Unsupported power source")
+            return
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        task.arguments = [scope, "lowpowermode", enabled ? "1" : "0"]
+
+        let errorPipe = Pipe()
+        task.standardError = errorPipe
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch let error {
+            completion(error.localizedDescription)
+            return
+        }
+
+        guard task.terminationStatus == 0 else {
+            let data = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let message = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            completion(message?.isEmpty == false ? message : "pmset failed with status \(task.terminationStatus)")
+            return
+        }
+        completion(nil)
+    }
     
     public func callSMC(_ arguments: [String]) -> (output: String?, error: String?) {
         guard let smc = self.smc else {

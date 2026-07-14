@@ -514,3 +514,23 @@
 "Pink" = "Pink";
 "Teal" = "Teal";
 "Indigo" = "Indigo";
+
+// One-click cooling
+"Cooling" = "Cooling";
+"Cool Now" = "Cool Now";
+"Stop Cooling" = "Stop Cooling";
+"Review" = "Review";
+"Top heat" = "Top heat";
+"Top heat sources appear here" = "Top heat sources appear here";
+"No heavy processes detected" = "No heavy processes detected";
+"No controllable fans were detected" = "No controllable fans were detected";
+"Target temperature reached" = "Target temperature reached";
+"Cooling stopped" = "Cooling stopped";
+"Cooling timer complete" = "Cooling timer complete";
+"Cooling • %@ • %02d:%02d remaining" = "Cooling • %@ • %02d:%02d remaining";
+"Low Power Mode on" = "Low Power Mode on";
+"full performance" = "full performance";
+"Fans boosted; Low Power Mode failed" = "Fans boosted; Low Power Mode failed";
+"Enabling fan control…" = "Enabling fan control…";
+"Fan control enabled—click Cool Now again" = "Fan control enabled—click Cool Now again";
+"Approve Stats in System Settings ▸ Login Items" = "Approve Stats in System Settings ▸ Login Items";
