@@ -1,6 +1,7 @@
 name: build
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - master
@@ -18,4 +19,19 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - run: xcodebuild -scheme Stats -destination 'platform=macOS' -configuration Release archive CODE_SIGNING_ALLOWED=NO
+      - name: Build unsigned archive
+        run: >-
+          xcodebuild -scheme Stats -destination 'platform=macOS'
+          -configuration Release -archivePath "$RUNNER_TEMP/Stats.xcarchive"
+          archive CODE_SIGNING_ALLOWED=NO
+      - name: Package app
+        run: >-
+          ditto -c -k --sequesterRsrc --keepParent
+          "$RUNNER_TEMP/Stats.xcarchive/Products/Applications/Stats.app"
+          "$RUNNER_TEMP/Stats-Cool-Now-unsigned.zip"
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stats-Cool-Now-unsigned
+          path: ${{ runner.temp }}/Stats-Cool-Now-unsigned.zip
+          if-no-files-found: error
