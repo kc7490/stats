@@ -560,7 +560,7 @@ private final class CoolingView: NSStackView {
         return output.split(separator: "\n").compactMap { line -> (Double, String)? in
             let fields = line.split(maxSplits: 2, whereSeparator: \.isWhitespace)
             guard fields.count == 3,
-                  Int(fields[0]) != ProcessInfo.processInfo.processIdentifier,
+                  let pid = Int(fields[0]), pid != ProcessInfo.processInfo.processIdentifier,
                   let cpu = Double(fields[1]), cpu >= 5 else { return nil }
             let name = URL(fileURLWithPath: String(fields[2])).lastPathComponent
             return (cpu, name)
